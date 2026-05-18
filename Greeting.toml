@@ -1,0 +1,42 @@
+# greeting.toml
+# All fields optional — defaults are used for anything omitted.
+
+[cache]
+show_cooldown   = 14400   # seconds between greeting displays (0 = always)
+update_interval = 28800   # seconds between daemon data refreshes
+# cache_dir = "/home/user/.cache/greeting"
+
+[display]
+date_format = "%b %d, %a"
+time_format = "%H:%M"
+lang        = "en"         # "en" or "ru"
+
+[colors]
+# Set any to "none" to disable. Use  all = "none"  to strip all ANSI.
+# all    = "none"
+green  = "\u001b[32m"
+yellow = "\u001b[33m"
+purple = "\u001b[38;5;147m"
+red    = "\u001b[31m"
+reset  = "\u001b[0m"
+bold   = "\u001b[1m"
+dim    = "\u001b[2m"
+
+[templates]
+# Variables: {user} {time_of_day} {date} {time} {updates} {errors}
+# Colors:    {c_green} {c_yellow} {c_purple} {c_red} {c_reset} {c_bold} {c_dim}
+
+greeting     = "Welcome, {c_green}{user}{c_reset}. Good {c_purple}{time_of_day}{c_reset}. Date: {c_yellow}{date}{c_reset} / Time: {c_green}{time}{c_reset}"
+
+# status_line overrides updates_*/errors_* with a single custom line:
+# status_line  = "{c_dim}upd:{c_reset} {updates}  {c_dim}err:{c_reset} {errors}"
+
+updates_none = "Fresh as ever — {c_purple}no updates{c_reset}"
+updates_some = "A fresh batch — {c_green}{updates} updates available{c_reset}"
+errors_none  = "Critical errors: {c_green}{errors}{c_reset}"
+errors_some  = "Critical errors: {c_red}{errors}{c_reset}"
+
+[commands]
+# Must print a single integer to stdout.
+updates = "checkupdates 2>/dev/null | wc -l"
+errors  = "journalctl -b -p emerg..alert -q --no-pager -o short 2>/dev/null | grep -Ev 'kactivitymanagerd|pam_unix|kglobalaccel|applications\\.menu' | grep -cE '^\\S'"
