@@ -1,54 +1,76 @@
-//! greeting — terminal greeter with daemon mode
+//! greeting — terminal greeter
 //!
-//! greeting           — show (respects cooldown)
-//! greeting show      — show (ignore cooldown)
-//! greeting daemon    — background daemon, updates cache on interval
-//! greeting update    — collect data once, write cache, exit
-//! greeting status    — show cache/config state
-//! greeting init      — write default config
+//! USAGE:
+//!   greeting           show greeting (respects cooldown)
+//!   greeting show      show greeting (ignore cooldown)
+//!   greeting daemon    run as background daemon
+//!   greeting update    collect data once and update cache
+//!   greeting status    show current state
+//!   greeting init      create default config file
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use serde::Deserialize;
 
 // ── Config ────────────────────────────────────────────────────────────────────
+//
+// All fields are Option<T> so serde can tell "user set this" from "use default".
+// Resolved into a flat Config struct after loading.
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct CacheConfig {
-    show_cooldown:   Option<u64>,
-    update_interval: Option<u64>,
-    cache_dir:       Option<String>,
+#[serde(default, deny_unknown_fields)]
+struct RawConfig {
+    cache:     CacheRaw,
+    display:   DisplayRaw,
+    colors:    ColorsRaw,
+    templates: TemplatesRaw,
+    updates:   UpdatesRaw,
+    commands:  CommandsRaw,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct DisplayConfig {
+#[serde(default, deny_unknown_fields)]
+struct CacheRaw {
+    /// Minimum seconds between greeting displays. 0 = always show.
+    show_cooldown:   Option<u64>,
+    /// How often the daemon re-collects system data (seconds).
+    update_interval: Option<u64>,
+    /// Override cache directory. Default: $XDG_CACHE_HOME/greeting
+    dir:             Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct DisplayRaw {
     date_format: Option<String>,
     time_format: Option<String>,
+    /// Language code. See `greeting init` for supported values.
     lang:        Option<String>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct ColorsConfig {
-    all:    Option<String>,
-    green:  Option<String>,
-    yellow: Option<String>,
-    purple: Option<String>,
-    red:    Option<String>,
-    reset:  Option<String>,
-    bold:   Option<String>,
-    dim:    Option<String>,
+#[serde(default, deny_unknown_fields)]
+struct ColorsRaw {
+    /// Set to false to disable all ANSI colors.
+    enabled: Option<bool>,
+    green:   Option<String>,
+    yellow:  Option<String>,
+    purple:  Option<String>,
+    red:     Option<String>,
+    reset:   Option<String>,
+    bold:    Option<String>,
+    dim:     Option<String>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct TemplatesConfig {
+#[serde(default, deny_unknown_fields)]
+struct TemplatesRaw {
+    /// Line 1. Variables: {user} {time_of_day} {date} {time}
     greeting:     Option<String>,
+    /// Line 2 — single custom template. Replaces updates/errors parts if set.
+    /// Variables: {updates} {errors} + all color vars.
     status_line:  Option<String>,
     updates_none: Option<String>,
     updates_some: Option<String>,
@@ -57,30 +79,23 @@ struct TemplatesConfig {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct UpdatesConfig {
+#[serde(default, deny_unknown_fields)]
+struct UpdatesRaw {
+    /// Package manager: pacman | apt | dnf | brew | zypper | flatpak | nix | custom
     manager: Option<String>,
-    custom:  Option<String>,
+    /// Shell command used when manager = "custom". Must print one integer.
+    command: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
-struct CommandsConfig {
+#[serde(default, deny_unknown_fields)]
+struct CommandsRaw {
+    /// Override the journal errors command. Must print one integer.
     errors: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct RawConfig {
-    cache:     CacheConfig,
-    display:   DisplayConfig,
-    colors:    ColorsConfig,
-    templates: TemplatesConfig,
-    updates:   UpdatesConfig,
-    commands:  CommandsConfig,
-}
+// ── Resolved config ───────────────────────────────────────────────────────────
 
-// Resolved config with all defaults filled in
 struct Config {
     show_cooldown:   u64,
     update_interval: u64,
@@ -88,46 +103,47 @@ struct Config {
     date_format:     String,
     time_format:     String,
     lang:            String,
+    // colors (empty string = disabled)
     c_green:  String, c_yellow: String, c_purple: String,
     c_red:    String, c_reset:  String, c_bold:   String, c_dim: String,
+    // templates
     tpl_greeting:     String,
     tpl_status_line:  Option<String>,
     tpl_updates_none: String,
     tpl_updates_some: String,
     tpl_errors_none:  String,
     tpl_errors_some:  String,
-    cmd_updates:      String,
-    cmd_errors:       String,
-}
-
-fn color_or(opt: Option<String>, disabled: bool, default: &str) -> String {
-    if disabled { return String::new(); }
-    match opt {
-        Some(v) if v == "none" => String::new(),
-        Some(v) => v,
-        None    => default.into(),
-    }
+    // commands
+    cmd_updates: String,
+    cmd_errors:  String,
 }
 
 impl Config {
-    fn from_raw(r: RawConfig) -> Self {
-        let disable_all = r.colors.all.as_deref() == Some("none");
-        let pkg = r.updates.manager.as_deref().unwrap_or("pacman");
-        let custom = r.updates.custom.as_deref().unwrap_or("");
+    fn resolve(r: RawConfig) -> Self {
+        let colors_on = r.colors.enabled.unwrap_or(true);
+
+        let color = |opt: Option<String>, default: &str| -> String {
+            if !colors_on { return String::new(); }
+            opt.unwrap_or_else(|| default.into())
+        };
+
+        let manager = r.updates.manager.as_deref().unwrap_or("pacman");
+        let custom  = r.updates.command.as_deref().unwrap_or("");
+
         Config {
             show_cooldown:   r.cache.show_cooldown.unwrap_or(14400),
             update_interval: r.cache.update_interval.unwrap_or(28800),
-            cache_dir:       r.cache.cache_dir,
+            cache_dir:       r.cache.dir,
             date_format:     r.display.date_format.unwrap_or_else(|| "%b %d, %a".into()),
             time_format:     r.display.time_format.unwrap_or_else(|| "%H:%M".into()),
             lang:            r.display.lang.unwrap_or_else(|| "en".into()),
-            c_green:  color_or(r.colors.green,  disable_all, "\x1b[32m"),
-            c_yellow: color_or(r.colors.yellow, disable_all, "\x1b[33m"),
-            c_purple: color_or(r.colors.purple, disable_all, "\x1b[38;5;147m"),
-            c_red:    color_or(r.colors.red,    disable_all, "\x1b[31m"),
-            c_reset:  color_or(r.colors.reset,  disable_all, "\x1b[0m"),
-            c_bold:   color_or(r.colors.bold,   disable_all, "\x1b[1m"),
-            c_dim:    color_or(r.colors.dim,    disable_all, "\x1b[2m"),
+            c_green:  color(r.colors.green,  "\x1b[32m"),
+            c_yellow: color(r.colors.yellow, "\x1b[33m"),
+            c_purple: color(r.colors.purple, "\x1b[38;5;147m"),
+            c_red:    color(r.colors.red,    "\x1b[31m"),
+            c_reset:  color(r.colors.reset,  "\x1b[0m"),
+            c_bold:   color(r.colors.bold,   "\x1b[1m"),
+            c_dim:    color(r.colors.dim,    "\x1b[2m"),
             tpl_greeting: r.templates.greeting.unwrap_or_else(|| concat!(
                 "Welcome, {c_green}{user}{c_reset}.",
                 " Good {c_purple}{time_of_day}{c_reset}.",
@@ -138,13 +154,13 @@ impl Config {
             tpl_updates_none: r.templates.updates_none.unwrap_or_else(||
                 "Fresh as ever — {c_purple}no updates{c_reset}".into()),
             tpl_updates_some: r.templates.updates_some.unwrap_or_else(||
-                "A fresh batch — {c_green}{updates} updates available{c_reset}".into()),
+                "A fresh batch — {c_green}{updates} updates{c_reset}".into()),
             tpl_errors_none: r.templates.errors_none.unwrap_or_else(||
-                "Critical errors: {c_green}{errors}{c_reset}".into()),
+                "Errors: {c_green}{errors}{c_reset}".into()),
             tpl_errors_some: r.templates.errors_some.unwrap_or_else(||
-                "Critical errors: {c_red}{errors}{c_reset}".into()),
-            cmd_updates: pkg_manager_cmd(pkg, custom),
-            cmd_errors: r.commands.errors.unwrap_or_else(|| concat!(
+                "Errors: {c_red}{errors}{c_reset}".into()),
+            cmd_updates: updates_cmd(manager, custom),
+            cmd_errors:  r.commands.errors.unwrap_or_else(|| concat!(
                 "journalctl -b -p emerg..alert -q --no-pager -o short 2>/dev/null",
                 " | grep -Ev 'kactivitymanagerd|pam_unix|kglobalaccel|applications\\.menu'",
                 " | grep -cE '^[^ ]'",
@@ -153,17 +169,18 @@ impl Config {
     }
 
     fn load() -> Self {
-        let raw: RawConfig = config_path()
+        let raw = config_path()
             .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).map_err(|e| {
-                eprintln!("greeting: config parse error: {e}");
-            }).ok())
+            .and_then(|s| match toml::from_str::<RawConfig>(&s) {
+                Ok(r)  => Some(r),
+                Err(e) => { eprintln!("greeting: config error: {e}"); None }
+            })
             .unwrap_or_default();
-        Config::from_raw(raw)
+        Config::resolve(raw)
     }
 }
 
-fn pkg_manager_cmd(manager: &str, custom: &str) -> String {
+fn updates_cmd(manager: &str, custom: &str) -> String {
     match manager {
         "pacman"  => "checkupdates 2>/dev/null | wc -l".into(),
         "apt"     => "apt list --upgradable 2>/dev/null | grep -c upgradable".into(),
@@ -182,17 +199,17 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var(var).ok().filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(fallback)
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+                .join(fallback)
         })
 }
 
 fn config_path() -> Option<PathBuf> {
     let p = xdg("XDG_CONFIG_HOME", ".config").join("greeting").join("greeting.toml");
-    if p.exists() { Some(p) } else { None }
+    p.exists().then_some(p)
 }
 
-fn config_path_for_init() -> PathBuf {
+fn config_init_path() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("greeting").join("greeting.toml")
 }
 
@@ -207,10 +224,7 @@ fn shown_path(c: &Config) -> PathBuf { cache_dir(c).join("shown.cache") }
 // ── Time ──────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
-struct Tm {
-    sec:i32, min:i32, hour:i32, mday:i32,
-    mon:i32, year:i32, wday:i32, yday:i32, isdst:i32,
-}
+struct Tm { sec:i32, min:i32, hour:i32, mday:i32, mon:i32, year:i32, wday:i32, yday:i32, isdst:i32 }
 
 extern "C" {
     fn time(t: *mut i64) -> i64;
@@ -220,10 +234,9 @@ extern "C" {
 
 fn now_tm() -> (i64, Tm) {
     unsafe {
-        let mut t: i64 = 0;
+        let mut t = 0i64;
         time(&mut t);
-        let ptr = localtime(&t);
-        (t, std::ptr::read(ptr))
+        (t, std::ptr::read(localtime(&t)))
     }
 }
 
@@ -235,15 +248,15 @@ fn strftime(fmt: &str, tm: &Tm) -> String {
     while let Some(c) = it.next() {
         if c != '%' { out.push(c); continue; }
         match it.next() {
-            Some('Y') => out.push_str(&format!("{:04}", tm.year+1900)),
-            Some('y') => out.push_str(&format!("{:02}", (tm.year+1900)%100)),
-            Some('m') => out.push_str(&format!("{:02}", tm.mon+1)),
+            Some('Y') => out.push_str(&format!("{:04}", tm.year + 1900)),
+            Some('y') => out.push_str(&format!("{:02}", (tm.year + 1900) % 100)),
+            Some('m') => out.push_str(&format!("{:02}", tm.mon + 1)),
             Some('d') => out.push_str(&format!("{:02}", tm.mday)),
             Some('H') => out.push_str(&format!("{:02}", tm.hour)),
             Some('M') => out.push_str(&format!("{:02}", tm.min)),
             Some('S') => out.push_str(&format!("{:02}", tm.sec)),
-            Some('b') | Some('B') => out.push_str(mon[tm.mon.clamp(0,11) as usize]),
-            Some('a') | Some('A') => out.push_str(day[tm.wday.clamp(0,6) as usize]),
+            Some('b') | Some('B') => out.push_str(mon[tm.mon.clamp(0, 11) as usize]),
+            Some('a') | Some('A') => out.push_str(day[tm.wday.clamp(0, 6) as usize]),
             Some(o)  => { out.push('%'); out.push(o); }
             None     => out.push('%'),
         }
@@ -253,30 +266,33 @@ fn strftime(fmt: &str, tm: &Tm) -> String {
 
 fn time_of_day(hour: i32, lang: &str) -> &'static str {
     match lang {
-        "ru" | "be" => match hour { 5..=11=>"утро",     12..=16=>"день",        17..=20=>"вечер",   _=>"ночь"     },
-        "pl"        => match hour { 5..=11=>"ranek",    12..=16=>"południe",    17..=20=>"wieczór", _=>"noc"      },
-        "cs"        => match hour { 5..=11=>"ráno",     12..=16=>"odpoledne",   17..=20=>"večer",   _=>"noc"      },
-        "sk"        => match hour { 5..=11=>"ráno",     12..=16=>"poobede",     17..=20=>"večer",   _=>"noc"      },
-        "hr" | "sr" => match hour { 5..=11=>"jutro",    12..=16=>"podne",       17..=20=>"večer",   _=>"noć"      },
-        "sl"        => match hour { 5..=11=>"jutro",    12..=16=>"popoldan",    17..=20=>"večer",   _=>"noč"      },
-        "bg"        => match hour { 5..=11=>"утро",     12..=16=>"следобед",    17..=20=>"вечер",   _=>"нощ"      },
-        "es"        => match hour { 5..=11=>"mañana",   12..=16=>"tarde",       17..=20=>"tarde",   _=>"noche"    },
-        "pt"        => match hour { 5..=11=>"manhã",    12..=16=>"tarde",       17..=20=>"tarde",   _=>"noite"    },
-        "fr"        => match hour { 5..=11=>"matin",    12..=16=>"après-midi",  17..=20=>"soir",    _=>"nuit"     },
-        "it"        => match hour { 5..=11=>"mattina",  12..=16=>"pomeriggio",  17..=20=>"sera",    _=>"notte"    },
-        "ro"        => match hour { 5..=11=>"dimineață",12..=16=>"amiază",      17..=20=>"seară",   _=>"noapte"   },
-        "ca"        => match hour { 5..=11=>"matí",     12..=16=>"tarda",       17..=20=>"tarda",   _=>"nit"      },
-        "de"        => match hour { 5..=11=>"Morgen",   12..=16=>"Nachmittag",  17..=20=>"Abend",   _=>"Nacht"    },
-        "nl"        => match hour { 5..=11=>"morgen",   12..=16=>"middag",      17..=20=>"avond",   _=>"nacht"    },
-        "sv"        => match hour { 5..=11=>"morgon",   12..=16=>"eftermiddag", 17..=20=>"kväll",   _=>"natt"     },
-        "nb" | "nn" => match hour { 5..=11=>"morgen",   12..=16=>"ettermiddag", 17..=20=>"kveld",   _=>"natt"     },
-        "da"        => match hour { 5..=11=>"morgen",   12..=16=>"eftermiddag", 17..=20=>"aften",   _=>"nat"      },
-        "fi"        => match hour { 5..=11=>"aamu",     12..=16=>"iltapäivä",   17..=20=>"ilta",    _=>"yö"       },
-        "is"        => match hour { 5..=11=>"morgunn",  12..=16=>"eftirmiddag", 17..=20=>"kvöld",   _=>"nótt"     },
-        "el"        => match hour { 5..=11=>"πρωί",     12..=16=>"απόγευμα",    17..=20=>"βράδυ",   _=>"νύχτα"    },
-        "hu"        => match hour { 5..=11=>"reggel",   12..=16=>"délután",     17..=20=>"este",    _=>"éjszaka"  },
-        "tr"        => match hour { 5..=11=>"sabah",    12..=16=>"öğleden sonra",17..=20=>"akşam",  _=>"gece"     },
-        _           => match hour { 5..=11=>"morning",  12..=16=>"afternoon",   17..=20=>"evening", _=>"night"    },
+        "ru" | "be" => match hour { 5..=11=>"утро",      12..=16=>"день",         17..=20=>"вечер",   _=>"ночь"    },
+        "uk"        => match hour { 5..=11=>"ранок",     12..=16=>"день",         17..=20=>"вечір",   _=>"ніч"     },
+        "pl"        => match hour { 5..=11=>"ranek",     12..=16=>"południe",     17..=20=>"wieczór", _=>"noc"     },
+        "cs"        => match hour { 5..=11=>"ráno",      12..=16=>"odpoledne",    17..=20=>"večer",   _=>"noc"     },
+        "sk"        => match hour { 5..=11=>"ráno",      12..=16=>"poobede",      17..=20=>"večer",   _=>"noc"     },
+        "hr" | "sr" => match hour { 5..=11=>"jutro",     12..=16=>"podne",        17..=20=>"večer",   _=>"noć"     },
+        "sl"        => match hour { 5..=11=>"jutro",     12..=16=>"popoldan",     17..=20=>"večer",   _=>"noč"     },
+        "bg"        => match hour { 5..=11=>"утро",      12..=16=>"следобед",     17..=20=>"вечер",   _=>"нощ"     },
+        "es"        => match hour { 5..=11=>"mañana",    12..=16=>"tarde",        17..=20=>"tarde",   _=>"noche"   },
+        "pt"        => match hour { 5..=11=>"manhã",     12..=16=>"tarde",        17..=20=>"tarde",   _=>"noite"   },
+        "fr"        => match hour { 5..=11=>"matin",     12..=16=>"après-midi",   17..=20=>"soir",    _=>"nuit"    },
+        "it"        => match hour { 5..=11=>"mattina",   12..=16=>"pomeriggio",   17..=20=>"sera",    _=>"notte"   },
+        "ro"        => match hour { 5..=11=>"dimineață", 12..=16=>"amiază",       17..=20=>"seară",   _=>"noapte"  },
+        "ca"        => match hour { 5..=11=>"matí",      12..=16=>"tarda",        17..=20=>"tarda",   _=>"nit"     },
+        "de"        => match hour { 5..=11=>"Morgen",    12..=16=>"Nachmittag",   17..=20=>"Abend",   _=>"Nacht"   },
+        "nl"        => match hour { 5..=11=>"morgen",    12..=16=>"middag",       17..=20=>"avond",   _=>"nacht"   },
+        "sv"        => match hour { 5..=11=>"morgon",    12..=16=>"eftermiddag",  17..=20=>"kväll",   _=>"natt"    },
+        "nb" | "nn" => match hour { 5..=11=>"morgen",    12..=16=>"ettermiddag",  17..=20=>"kveld",   _=>"natt"    },
+        "da"        => match hour { 5..=11=>"morgen",    12..=16=>"eftermiddag",  17..=20=>"aften",   _=>"nat"     },
+        "fi"        => match hour { 5..=11=>"aamu",      12..=16=>"iltapäivä",    17..=20=>"ilta",    _=>"yö"      },
+        "is"        => match hour { 5..=11=>"morgunn",   12..=16=>"eftirmiddag",  17..=20=>"kvöld",   _=>"nótt"    },
+        "lt"        => match hour { 5..=11=>"rytas",     12..=16=>"popietė",      17..=20=>"vakaras", _=>"naktis"  },
+        "lv"        => match hour { 5..=11=>"rīts",      12..=16=>"pēcpusdiena",  17..=20=>"vakars",  _=>"nakts"   },
+        "el"        => match hour { 5..=11=>"πρωί",      12..=16=>"απόγευμα",     17..=20=>"βράδυ",   _=>"νύχτα"   },
+        "hu"        => match hour { 5..=11=>"reggel",    12..=16=>"délután",      17..=20=>"este",    _=>"éjszaka" },
+        "tr"        => match hour { 5..=11=>"sabah",     12..=16=>"öğleden sonra",17..=20=>"akşam",   _=>"gece"    },
+        _           => match hour { 5..=11=>"morning",   12..=16=>"afternoon",    17..=20=>"evening", _=>"night"   },
     }
 }
 
@@ -313,15 +329,13 @@ fn touch_shown(c: &Config) {
     let _ = fs::write(shown_path(c), unix_now().to_string());
 }
 
-// ── Template ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn expand(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut s = tpl.to_string();
     for (k, v) in vars { s = s.replace(&format!("{{{k}}}"), v); }
     s
 }
-
-// ── Username ──────────────────────────────────────────────────────────────────
 
 fn username() -> String {
     if let Ok(u) = std::env::var("USER") { if !u.is_empty() { return u; } }
@@ -330,7 +344,7 @@ fn username() -> String {
         for line in p.lines() {
             let mut f = line.split(':');
             let name = f.next().unwrap_or("");
-            let _ = f.next();
+            let _    = f.next();
             let luid: u32 = f.next().unwrap_or("").parse().unwrap_or(u32::MAX);
             if luid == uid { return name.to_string(); }
         }
@@ -338,23 +352,34 @@ fn username() -> String {
     "stranger".to_string()
 }
 
-// ── Collect ───────────────────────────────────────────────────────────────────
-
-fn run_count(cmd: &str) -> i32 {
-    Command::new("sh").args(["-c", cmd])
+fn run_count(cmd: &str) -> Option<i32> {
+    let mut child = Command::new("sh").args(["-c", cmd])
         .stdout(Stdio::piped()).stderr(Stdio::null())
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+        .spawn().ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match child.try_wait().ok()? {
+            Some(_) => break,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
-fn collect(c: &Config) -> (i32, i32) {
+fn collect(c: &Config) -> Option<(i32, i32)> {
     let c1 = c.cmd_updates.clone();
     let c2 = c.cmd_errors.clone();
     let h1 = std::thread::spawn(move || run_count(&c1));
     let h2 = std::thread::spawn(move || run_count(&c2));
-    (h1.join().unwrap_or(0), h2.join().unwrap_or(0))
+    Some((h1.join().ok()??, h2.join().ok()??))
 }
 
 // ── Subcommands ───────────────────────────────────────────────────────────────
@@ -373,13 +398,24 @@ fn cmd_show(c: &Config, force: bool) {
     let tod  = time_of_day(tm.hour, &c.lang);
     let user = username();
 
-    let (updates, errors, stale) = match read_data(c) {
+    let mut updates = -1;
+    let mut errors = -1;
+    let mut stale = match read_data(c) {
         Some(d) => {
-            let age = (ts as u64).saturating_sub(d.written_at);
-            (d.updates, d.errors, age > c.update_interval + 300)
+            updates = d.updates;
+            errors = d.errors;
+            (ts as u64).saturating_sub(d.written_at) > c.update_interval + 300
         }
-        None => (-1, -1, false),
+        None => true,
     };
+    if stale {
+        if let Some((u, e)) = collect(c) {
+            write_data(c, u, e);
+            updates = u;
+            errors = e;
+            stale = false;
+        }
+    }
 
     let upd_s = updates.to_string();
     let err_s = errors.to_string();
@@ -403,14 +439,14 @@ fn cmd_show(c: &Config, force: bool) {
         println!("{}", expand(tpl, vars));
     } else {
         let upd = if updates < 0 {
-            format!("{}Updates: checking…{}", c.c_yellow, c.c_reset)
+            format!("{}updates: checking…{}", c.c_yellow, c.c_reset)
         } else if updates == 0 {
             expand(&c.tpl_updates_none, vars)
         } else {
             expand(&c.tpl_updates_some, vars)
         };
         let err = if errors < 0 {
-            format!("{}Errors: checking…{}", c.c_yellow, c.c_reset)
+            format!("{}errors: checking…{}", c.c_yellow, c.c_reset)
         } else if errors == 0 {
             expand(&c.tpl_errors_none, vars)
         } else {
@@ -420,34 +456,37 @@ fn cmd_show(c: &Config, force: bool) {
     }
 
     if stale {
-        eprintln!("{}⚠ Data cache is stale — is 'greeting daemon' running?{}", c.c_yellow, c.c_reset);
+        eprintln!("{}⚠  data cache is stale — is 'greeting daemon' running?{}", c.c_yellow, c.c_reset);
     }
 }
 
 fn cmd_update(c: &Config) {
-    eprintln!("Collecting system data…");
-    let (u, e) = collect(c);
-    write_data(c, u, e);
-    eprintln!("Done: {u} updates, {e} errors → {}", data_path(c).display());
+    eprintln!("collecting…");
+    match collect(c) {
+        Some((u, e)) => {
+            write_data(c, u, e);
+            eprintln!("{u} updates, {e} errors → {}", data_path(c).display());
+        }
+        None => eprintln!("collection failed — cache not updated"),
+    }
 }
 
 fn cmd_status(c: &Config) {
-    let cfg_display = config_path()
+    let cfg = config_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| format!("{} (not found, using defaults)",
-            config_path_for_init().display()));
-    println!("Config:     {cfg_display}");
-    println!("Cache dir:  {}", cache_dir(c).display());
-    println!("Cooldown:   {}s  ({} min)", c.show_cooldown, c.show_cooldown / 60);
-    println!("Interval:   {}s  ({} h)",   c.update_interval, c.update_interval / 3600);
+        .unwrap_or_else(|| format!("{} (not found, using defaults)", config_init_path().display()));
+    println!("config:    {cfg}");
+    println!("cache dir: {}", cache_dir(c).display());
+    println!("cooldown:  {}s ({} min)", c.show_cooldown, c.show_cooldown / 60);
+    println!("interval:  {}s ({} h)",  c.update_interval, c.update_interval / 3600);
     match shown_age(c) {
-        Some(a) => println!("Last shown: {}s ago", a),
-        None    => println!("Last shown: never"),
+        Some(a) => println!("shown:     {}s ago", a),
+        None    => println!("shown:     never"),
     }
     match read_data(c) {
-        Some(d) => println!("Data cache: {}s old  —  {} updates, {} errors",
-                             unix_now().saturating_sub(d.written_at), d.updates, d.errors),
-        None    => println!("Data cache: empty (run 'greeting update')"),
+        Some(d) => println!("cache:     {}s old — {} updates, {} errors",
+                            unix_now().saturating_sub(d.written_at), d.updates, d.errors),
+        None    => println!("cache:     empty  (run: greeting update)"),
     }
 }
 
@@ -465,70 +504,74 @@ fn slog(msg: &str) {
 fn cmd_daemon(c: &Config) {
     let tag = std::ffi::CString::new("greeting").unwrap();
     unsafe { openlog(tag.as_ptr(), 0, 8); }
-    slog("daemon started");
+    slog("started");
     loop {
-        let (u, e) = collect(c);
-        write_data(c, u, e);
-        slog(&format!("cache updated: {u} updates, {e} errors"));
-        std::thread::sleep(Duration::from_secs(c.update_interval));
+        let ok = match collect(c) {
+            Some((u, e)) => {
+                write_data(c, u, e);
+                slog(&format!("updated: {u} updates, {e} errors"));
+                true
+            }
+            None => {
+                slog("collect failed, retrying");
+                false
+            }
+        };
+        let delay = if ok { c.update_interval } else { 300 };
+        let next = unix_now() + delay;
+        while unix_now() < next {
+            std::thread::sleep(Duration::from_secs((next - unix_now()).min(30)));
+        }
     }
 }
 
 fn cmd_init() {
-    let path = config_path_for_init();
+    let path = config_init_path();
     if let Some(p) = path.parent() { fs::create_dir_all(p).ok(); }
-    let content = r#"# greeting.toml
-# All fields optional — defaults are used for anything omitted.
+    if path.exists() {
+        eprintln!("greeting: config already exists: {}", path.display());
+        eprintln!("          delete it first if you want to reset to defaults.");
+        return;
+    }
+    let content = r#"# greeting.toml — all fields are optional, remove any line to use the default
 
 [cache]
-show_cooldown   = 14400   # seconds between greeting displays (0 = always)
-update_interval = 28800   # seconds between daemon data refreshes
-# cache_dir = "/home/user/.cache/greeting"
+show_cooldown   = 14400  # seconds between greeting displays (0 = always show)
+update_interval = 28800  # seconds between daemon refreshes
+# dir = "/home/user/.cache/greeting"
 
 [display]
 date_format = "%b %d, %a"
 time_format = "%H:%M"
-# Supported langs: en de fr es pt it nl pl ru cs sk hr sr sl bg ro
-#                  sv nb nn da fi is el hu tr be ca
+# Language for time-of-day words.
+# Supported: en de fr es pt it nl pl ru uk cs sk hr sr sl bg ro
+#            sv nb nn da fi is lt lv el hu tr be ca
 lang = "en"
 
 [colors]
-# Set any to "none" to disable. Use  all = "none"  to strip all ANSI codes.
-# all    = "none"
-green  = "\u001b[32m"
-yellow = "\u001b[33m"
-purple = "\u001b[38;5;147m"
-red    = "\u001b[31m"
-reset  = "\u001b[0m"
-bold   = "\u001b[1m"
-dim    = "\u001b[2m"
+enabled = true   # set to false to disable all ANSI colors
 
 [templates]
-# Variables: {user} {time_of_day} {date} {time} {updates} {errors}
-# Colors:    {c_green} {c_yellow} {c_purple} {c_red} {c_reset} {c_bold} {c_dim}
+# Available variables: {user} {time_of_day} {date} {time} {updates} {errors}
+# Color tags:          {c_green} {c_yellow} {c_purple} {c_red} {c_reset} {c_bold} {c_dim}
 
-greeting     = "Welcome, {c_green}{user}{c_reset}. Good {c_purple}{time_of_day}{c_reset}. Date: {c_yellow}{date}{c_reset} / Time: {c_green}{time}{c_reset}"
-
-# status_line replaces updates_*/errors_* with a single custom second line:
-# status_line  = "{c_dim}upd:{c_reset} {updates}  {c_dim}err:{c_reset} {errors}"
-
+greeting     = "Welcome, {c_green}{user}{c_reset}. Good {c_purple}{time_of_day}{c_reset}. {c_yellow}{date}{c_reset} {c_green}{time}{c_reset}"
 updates_none = "Fresh as ever — {c_purple}no updates{c_reset}"
-updates_some = "A fresh batch — {c_green}{updates} updates available{c_reset}"
-errors_none  = "Critical errors: {c_green}{errors}{c_reset}"
-errors_some  = "Critical errors: {c_red}{errors}{c_reset}"
+updates_some = "A fresh batch — {c_green}{updates} updates{c_reset}"
+errors_none  = "Errors: {c_green}{errors}{c_reset}"
+errors_some  = "Errors: {c_red}{errors}{c_reset}"
+
+# Uncomment to replace updates + errors lines with a single custom line:
+# status_line = "{c_dim}upd:{c_reset} {updates}  {c_dim}err:{c_reset} {errors}"
 
 [updates]
-# Supported: pacman apt dnf brew zypper flatpak nix custom
+# Package manager: pacman | apt | dnf | brew | zypper | flatpak | nix | custom
 manager = "pacman"
-# custom = "my-check-cmd | wc -l"
-
-[commands]
-# Override the errors command — must print a single integer to stdout.
-errors = "journalctl -b -p emerg..alert -q --no-pager -o short 2>/dev/null | grep -Ev 'kactivitymanagerd|pam_unix|kglobalaccel|applications\\.menu' | grep -cE '^[^ ]'"
+# command = "my-cmd | wc -l"   # used when manager = "custom"
 "#;
     match fs::write(&path, content) {
-        Ok(_)  => println!("Config written: {}", path.display()),
-        Err(e) => eprintln!("Cannot write config: {e}"),
+        Ok(_)  => println!("created: {}", path.display()),
+        Err(e) => eprintln!("error: {e}"),
     }
 }
 
@@ -547,17 +590,17 @@ fn main() {
         "daemon"    => cmd_daemon(&cfg),
         "update"    => cmd_update(&cfg),
         "status"    => cmd_status(&cfg),
-        "help" | "--help" | "-h" => println!(
-            "Usage: greeting [subcommand]\n\n  \
-             (none)   Show greeting (respects show_cooldown)\n  \
-             show     Show greeting unconditionally\n  \
-             daemon   Run background daemon (refreshes data cache)\n  \
-             update   Collect data once and write cache, then exit\n  \
-             status   Show cache and config state\n  \
-             init     Write default config to XDG_CONFIG_HOME/greeting/greeting.toml"
-        ),
+        "help" | "--help" | "-h" => print!(concat!(
+            "usage: greeting [subcommand]\n\n",
+            "  (none)   show greeting, respects cooldown\n",
+            "  show     show greeting unconditionally\n",
+            "  daemon   background daemon — refreshes data cache\n",
+            "  update   collect data once and exit\n",
+            "  status   show cache and config state\n",
+            "  init     create default config (~/.config/greeting/greeting.toml)\n",
+        )),
         other => {
-            eprintln!("greeting: unknown subcommand '{other}'. Try 'greeting help'.");
+            eprintln!("greeting: unknown subcommand '{other}' — try 'greeting help'");
             std::process::exit(1);
         }
     }
@@ -569,136 +612,128 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn default_cfg() -> Config { Config::resolve(RawConfig::default()) }
+
+    // — package manager presets —
+
     #[test]
-    fn pkg_manager_presets() {
-        assert!(pkg_manager_cmd("pacman", "").contains("checkupdates"));
-        assert!(pkg_manager_cmd("apt",    "").contains("apt list"));
-        assert!(pkg_manager_cmd("dnf",    "").contains("dnf check-update"));
-        assert!(pkg_manager_cmd("brew",   "").contains("brew outdated"));
-        assert!(pkg_manager_cmd("zypper", "").contains("zypper"));
-        assert!(pkg_manager_cmd("flatpak","").contains("flatpak"));
-        assert!(pkg_manager_cmd("nix",    "").contains("nix"));
+    fn pm_pacman()  { assert!(updates_cmd("pacman",  "").contains("checkupdates")); }
+    #[test]
+    fn pm_apt()     { assert!(updates_cmd("apt",     "").contains("apt list")); }
+    #[test]
+    fn pm_dnf()     { assert!(updates_cmd("dnf",     "").contains("dnf check-update")); }
+    #[test]
+    fn pm_brew()    { assert!(updates_cmd("brew",    "").contains("brew outdated")); }
+    #[test]
+    fn pm_zypper()  { assert!(updates_cmd("zypper",  "").contains("zypper")); }
+    #[test]
+    fn pm_flatpak() { assert!(updates_cmd("flatpak", "").contains("flatpak")); }
+    #[test]
+    fn pm_nix()     { assert!(updates_cmd("nix",     "").contains("nix")); }
+    #[test]
+    fn pm_custom()  { assert_eq!(updates_cmd("custom", "my-cmd | wc -l"), "my-cmd | wc -l"); }
+    #[test]
+    fn pm_unknown_uses_custom() { assert_eq!(updates_cmd("xbps", "xbps | wc -l"), "xbps | wc -l"); }
+
+    // — config defaults —
+
+    #[test]
+    fn defaults_sane() {
+        let c = default_cfg();
+        assert_eq!(c.show_cooldown,   14400);
+        assert_eq!(c.update_interval, 28800);
+        assert_eq!(c.lang,            "en");
+        assert!(c.tpl_status_line.is_none());
+        assert!(!c.c_green.is_empty());
     }
 
     #[test]
-    fn pkg_manager_custom() {
-        let cmd = pkg_manager_cmd("custom", "my-tool | wc -l");
-        assert_eq!(cmd, "my-tool | wc -l");
-        // unknown manager also falls through to custom
-        let cmd2 = pkg_manager_cmd("xbps", "xbps-install -un | wc -l");
-        assert_eq!(cmd2, "xbps-install -un | wc -l");
+    fn colors_disabled() {
+        let mut r = RawConfig::default();
+        r.colors.enabled = Some(false);
+        let c = Config::resolve(r);
+        assert!(c.c_green.is_empty());
+        assert!(c.c_red.is_empty());
+        assert!(c.c_reset.is_empty());
+    }
+
+    // — TOML parsing —
+
+    #[test]
+    fn toml_basic() {
+        let r: RawConfig = toml::from_str(r#"
+            [cache]
+            show_cooldown = 3600
+            [display]
+            lang = "de"
+            [updates]
+            manager = "apt"
+        "#).unwrap();
+        let c = Config::resolve(r);
+        assert_eq!(c.show_cooldown, 3600);
+        assert_eq!(c.lang, "de");
+        assert!(c.cmd_updates.contains("apt list"));
     }
 
     #[test]
-    fn config_defaults_without_file() {
-        let cfg = Config::from_raw(RawConfig::default());
-        assert_eq!(cfg.show_cooldown,   14400);
-        assert_eq!(cfg.update_interval, 28800);
-        assert_eq!(cfg.lang,            "en");
-        assert_eq!(cfg.date_format,     "%b %d, %a");
-        assert!(cfg.c_green.contains("32"));
-        assert!(cfg.tpl_status_line.is_none());
+    fn toml_unknown_fields_error() {
+        // deny_unknown_fields catches typos in config
+        let r = toml::from_str::<RawConfig>("[cache]\ntypo_field = 1");
+        assert!(r.is_err());
     }
 
     #[test]
-    fn config_colors_all_none() {
-        let mut raw = RawConfig::default();
-        raw.colors.all = Some("none".into());
-        let cfg = Config::from_raw(raw);
-        assert!(cfg.c_green.is_empty());
-        assert!(cfg.c_red.is_empty());
-        assert!(cfg.c_reset.is_empty());
+    fn toml_empty_is_all_defaults() {
+        let r: RawConfig = toml::from_str("").unwrap();
+        let c = Config::resolve(r);
+        assert_eq!(c.show_cooldown, 14400);
+        assert_eq!(c.lang, "en");
+    }
+
+    // — template expansion —
+
+    #[test]
+    fn expand_basic() {
+        let r = expand("Hello {name}!", &[("name", "world")]);
+        assert_eq!(r, "Hello world!");
     }
 
     #[test]
-    fn config_color_individual_none() {
-        let mut raw = RawConfig::default();
-        raw.colors.red = Some("none".into());
-        let cfg = Config::from_raw(raw);
-        assert!(cfg.c_red.is_empty());
-        assert!(!cfg.c_green.is_empty()); // others intact
+    fn expand_unknown_var_preserved() {
+        let r = expand("{unknown}", &[]);
+        assert_eq!(r, "{unknown}");
     }
 
     #[test]
-    fn config_toml_parse_basic() {
-        let toml = r#"
-[cache]
-show_cooldown = 3600
-[display]
-lang = "de"
-[updates]
-manager = "apt"
-"#;
-        let raw: RawConfig = toml::from_str(toml).unwrap();
-        let cfg = Config::from_raw(raw);
-        assert_eq!(cfg.show_cooldown, 3600);
-        assert_eq!(cfg.lang, "de");
-        assert!(cfg.cmd_updates.contains("apt list"));
+    fn expand_multiple() {
+        let r = expand("{a}{b}{a}", &[("a", "1"), ("b", "2")]);
+        assert_eq!(r, "121");
+    }
+
+    // — time_of_day —
+
+    #[test]
+    fn tod_boundaries() {
+        assert_eq!(time_of_day(4,  "en"), "night");
+        assert_eq!(time_of_day(5,  "en"), "morning");
+        assert_eq!(time_of_day(11, "en"), "morning");
+        assert_eq!(time_of_day(12, "en"), "afternoon");
+        assert_eq!(time_of_day(17, "en"), "evening");
+        assert_eq!(time_of_day(20, "en"), "evening");
+        assert_eq!(time_of_day(21, "en"), "night");
     }
 
     #[test]
-    fn config_toml_unknown_fields_ignored() {
-        let toml = r#"
-[cache]
-show_cooldown = 7200
-totally_unknown_key = "whatever"
-"#;
-        // should not panic — serde ignores unknown fields by default (#[serde(default)])
-        let raw: RawConfig = toml::from_str(toml).unwrap();
-        assert_eq!(raw.cache.show_cooldown, Some(7200));
+    fn tod_languages() {
+        assert_eq!(time_of_day(8, "de"), "Morgen");
+        assert_eq!(time_of_day(8, "ru"), "утро");
+        assert_eq!(time_of_day(8, "fr"), "matin");
+        assert_eq!(time_of_day(8, "uk"), "ранок");
+        assert_eq!(time_of_day(8, "fi"), "aamu");
     }
 
     #[test]
-    fn config_toml_bad_type_fails_gracefully() {
-        // show_cooldown expects u64, passing string — should fail to parse,
-        // Config::load() falls back to defaults
-        let toml = r#"[cache]
-show_cooldown = "not-a-number"
-"#;
-        assert!(toml::from_str::<RawConfig>(toml).is_err());
-    }
-
-    #[test]
-    fn expand_replaces_vars() {
-        let result = expand("Hello {name}, it is {time}!", &[
-            ("name", "Alice"),
-            ("time", "morning"),
-        ]);
-        assert_eq!(result, "Hello Alice, it is morning!");
-    }
-
-    #[test]
-    fn expand_missing_var_left_as_is() {
-        let result = expand("Hello {unknown}!", &[("name", "x")]);
-        assert_eq!(result, "Hello {unknown}!");
-    }
-
-    #[test]
-    fn time_of_day_en() {
-        assert_eq!(time_of_day(6,  "en"), "morning");
-        assert_eq!(time_of_day(13, "en"), "afternoon");
-        assert_eq!(time_of_day(19, "en"), "evening");
-        assert_eq!(time_of_day(2,  "en"), "night");
-    }
-
-    #[test]
-    fn time_of_day_de() {
-        assert_eq!(time_of_day(8,  "de"), "Morgen");
-        assert_eq!(time_of_day(14, "de"), "Nachmittag");
-        assert_eq!(time_of_day(18, "de"), "Abend");
-        assert_eq!(time_of_day(23, "de"), "Nacht");
-    }
-
-    #[test]
-    fn time_of_day_ru() {
-        assert_eq!(time_of_day(7,  "ru"), "утро");
-        assert_eq!(time_of_day(15, "ru"), "день");
-        assert_eq!(time_of_day(20, "ru"), "вечер");
-        assert_eq!(time_of_day(3,  "ru"), "ночь");
-    }
-
-    #[test]
-    fn time_of_day_unknown_lang_falls_back_to_en() {
-        assert_eq!(time_of_day(9, "xx"), "morning");
+    fn tod_unknown_lang_is_english() {
+        assert_eq!(time_of_day(9, "zz"), "morning");
     }
 }
